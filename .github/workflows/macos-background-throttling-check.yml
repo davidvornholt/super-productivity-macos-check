@@ -16,8 +16,8 @@ permissions:
   contents: read
 
 env:
-  SHOWN_MS: '20000'
-  PHASE_MS: '45000'
+  SHOWN_MS: '120000'
+  PHASE_MS: '660000'
 
 jobs:
   check:
@@ -29,8 +29,10 @@ jobs:
       matrix:
         include:
           - { os: macos-15, variant: after }
-          - { os: macos-15, variant: control }
+          - { os: macos-26, variant: after }
+          - { os: macos-15, variant: before }
           - { os: macos-26, variant: before }
+          - { os: macos-15, variant: control }
     steps:
       - name: Check out the check scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
