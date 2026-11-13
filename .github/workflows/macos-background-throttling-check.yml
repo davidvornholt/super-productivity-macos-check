@@ -9,7 +9,9 @@ name: macOS background throttling check
 #
 # GitHub's macOS images turn App Nap off for every app (NSAppSleepDisabled in
 # images/macos/scripts/build/configure-machine.sh of actions/runner-images).
-# The check turns it back on, as on a normal Mac.
+# The check turns it back on, as on a normal Mac, and starts the app through
+# LaunchServices (open -a), since macOS treats a process the runner spawns
+# directly as part of a daemon, which App Nap never applies to.
 
 on:
   workflow_dispatch:
@@ -22,6 +24,7 @@ permissions:
 env:
   SHOWN_MS: '120000'
   PHASE_MS: '660000'
+  LAUNCH: open
 
 jobs:
   check:
@@ -93,6 +96,7 @@ jobs:
           pmset -g
           pmset -g assertions || true
           ls -l /usr/bin/taskinfo || true
+          open --help 2>&1 | grep -iE -- "--env|--stdout" || true
 
       - name: Turn App Nap back on
         run: |

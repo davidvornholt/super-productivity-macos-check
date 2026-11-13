@@ -388,7 +388,9 @@ const drive = async () => {
         coversMainWindow: contains(cover.bounds, stateStart.bounds),
       };
     }
-    await run('screencapture', ['-x', path.join(OUT, `${step.name}.png`)]);
+    if (process.env.BG_CHECK_SCREENSHOTS !== '0') {
+      await run('screencapture', ['-x', path.join(OUT, `${step.name}.png`)]);
+    }
     phase.metricsStart = appMetrics();
     phase.tStart = Date.now();
     // Snapshot the processes' scheduling policy once App Nap would have kicked in.

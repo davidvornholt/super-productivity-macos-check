@@ -198,50 +198,105 @@ const toMarkdown = (summary) => {
 // Run
 // ---------------------------------------------------------------------------
 
+// LAUNCH=open starts the app through LaunchServices, as Finder or the Dock
+// would. Spawned directly, it runs as a child of the runner's daemon, which
+// macOS doesn't treat as an app, so App Nap could never apply to it.
+const LAUNCH_WITH_OPEN = process.env.LAUNCH === 'open';
+
 const runApp = (userDataDir) =>
   new Promise((resolve) => {
-    const appLog = fs.createWriteStream(path.join(outDir, 'app.log'));
-    const child = spawn(electronPath, [appDir, `--user-data-dir=${userDataDir}`], {
-      cwd: appDir,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: {
-        ...process.env,
-        NODE_ENV: 'PROD',
-        NODE_OPTIONS: `--require ${DRIVER}`,
-        BG_CHECK_OUT: outDir,
-        BG_CHECK_PHASE_MS: String(PHASE_MS),
-        BG_CHECK_SHOWN_MS: String(SHOWN_MS),
-        BG_CHECK_COVER: COVER_SCRIPT,
-        BG_CHECK_ELECTRON: electronPath,
-      },
-    });
+    const env = {
+      NODE_ENV: 'PROD',
+      NODE_OPTIONS: `--require ${DRIVER}`,
+      BG_CHECK_OUT: outDir,
+      BG_CHECK_PHASE_MS: String(PHASE_MS),
+      BG_CHECK_SHOWN_MS: String(SHOWN_MS),
+      BG_CHECK_COVER: COVER_SCRIPT,
+      BG_CHECK_ELECTRON: electronPath,
+      // A LaunchServices-launched app has no screen recording permission.
+      BG_CHECK_SCREENSHOTS: LAUNCH_WITH_OPEN ? '0' : '1',
+    };
+    const appArgs = [appDir, `--user-data-dir=${userDataDir}`];
+    const appLogPath = path.join(outDir, 'app.log');
+    let child;
     let driverLoaded = false;
-    const onData = (d) => {
-      appLog.write(d);
-      for (const line of String(d).split('\n')) {
-        if (line.includes('[bg-check]')) {
-          driverLoaded = true;
-          console.log(line);
+    let logTimer = null;
+    if (LAUNCH_WITH_OPEN) {
+      const bundle = path.resolve(electronPath, '../../..');
+      const errLogPath = path.join(outDir, 'app.stderr.log');
+      fs.writeFileSync(appLogPath, '');
+      fs.writeFileSync(errLogPath, '');
+      child = spawn(
+        'open',
+        [
+          '-n',
+          '-W',
+          '--stdout',
+          appLogPath,
+          '--stderr',
+          errLogPath,
+          ...Object.entries(env).flatMap(([k, v]) => ['--env', `${k}=${v}`]),
+          '-a',
+          bundle,
+          '--args',
+          ...appArgs,
+        ],
+        { stdio: 'inherit' },
+      );
+      let printed = 0;
+      logTimer = setInterval(() => {
+        const lines = fs.readFileSync(appLogPath, 'utf8').split('\n');
+        for (const line of lines.slice(printed, -1)) {
+          if (line.includes('[bg-check]')) {
+            driverLoaded = true;
+            console.log(line);
+          }
         }
+        printed = Math.max(printed, lines.length - 1);
+      }, 5 * SECOND);
+    } else {
+      const appLog = fs.createWriteStream(appLogPath);
+      child = spawn(electronPath, appArgs, {
+        cwd: appDir,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, ...env },
+      });
+      const onData = (d) => {
+        appLog.write(d);
+        for (const line of String(d).split('\n')) {
+          if (line.includes('[bg-check]')) {
+            driverLoaded = true;
+            console.log(line);
+          }
+        }
+      };
+      child.stdout.on('data', onData);
+      child.stderr.on('data', onData);
+      child.once('exit', () => appLog.end());
+    }
+    const kill = () => {
+      child.kill('SIGKILL');
+      if (LAUNCH_WITH_OPEN) {
+        execFile('pkill', ['-9', '-f', userDataDir], () => undefined);
       }
     };
-    child.stdout.on('data', onData);
-    child.stderr.on('data', onData);
     const budget = SHOWN_MS + 3 * PHASE_MS + 10 * MINUTE;
     const killTimer = setTimeout(() => {
       log('the app ran out of time, killing it');
-      child.kill('SIGKILL');
+      kill();
     }, budget);
     const loadTimer = setTimeout(() => {
       if (!driverLoaded) {
         log('the driver did not load, killing the app');
-        child.kill('SIGKILL');
+        kill();
       }
     }, 2 * MINUTE);
     child.once('exit', (code, signal) => {
       clearTimeout(killTimer);
       clearTimeout(loadTimer);
-      appLog.end();
+      if (logTimer) {
+        clearInterval(logTimer);
+      }
       resolve({ code, signal });
     });
   });
