@@ -16,8 +16,35 @@ if (process.type !== 'browser') {
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const Module = require('node:module');
 const { spawn, execFile } = require('node:child_process');
-const { app, BrowserWindow, ipcMain, Tray } = require('electron');
+
+// Preloaded modules run before Electron provides require('electron'). Start
+// on the first module load after it does, which is before the app's code.
+let app;
+let BrowserWindow;
+let ipcMain;
+let Tray;
+let started = false;
+let probing = false;
+const originalLoad = Module._load;
+Module._load = function (...args) {
+  if (!started && !probing) {
+    probing = true;
+    let electron = null;
+    try {
+      electron = require('electron');
+    } catch {
+      // not yet
+    }
+    probing = false;
+    if (electron && electron.app) {
+      started = true;
+      init(electron);
+    }
+  }
+  return originalLoad.apply(this, args);
+};
 
 const SECOND = 1000;
 const OUT = process.env.BG_CHECK_OUT;
@@ -46,52 +73,55 @@ const run = (cmd, args, timeout = 20 * SECOND) =>
     );
   });
 
-log('driver loaded', `electron ${process.versions.electron}`, `pid ${process.pid}`);
-
 // ---------------------------------------------------------------------------
 // Probes, installed before the app's own code runs
 // ---------------------------------------------------------------------------
 
 const probe = { ipc: [], tray: [], trayPatch: 'not installed', switches: {} };
 
-// The renderer sends this after every tracking tick; it carries the task.
-ipcMain.on('CURRENT_TASK_UPDATED', (_ev, task) => {
-  probe.ipc.push([Date.now(), task ? task.timeSpent : null]);
-});
+function init(electron) {
+  ({ app, BrowserWindow, ipcMain, Tray } = electron);
+  log('driver loaded', `electron ${process.versions.electron}`, `pid ${process.pid}`);
 
-try {
-  const original = Tray.prototype.setTitle;
-  Tray.prototype.setTitle = function (title, ...rest) {
-    probe.tray.push([Date.now(), String(title)]);
-    return original.call(this, title, ...rest);
-  };
-  probe.trayPatch = 'ok';
-} catch (error) {
-  probe.trayPatch = String(error);
-}
+  // The renderer sends this after every tracking tick; it carries the task.
+  ipcMain.on('CURRENT_TASK_UPDATED', (_ev, task) => {
+    probe.ipc.push([Date.now(), task ? task.timeSpent : null]);
+  });
 
-app.once('ready', () => {
-  // Nobody uses the runner's keyboard or mouse. Report an active user, as if
-  // they were working in another app; otherwise idle detection stops adding
-  // time after 5 minutes and the comparison would be meaningless.
-  const { powerMonitor } = require('electron');
-  powerMonitor.getSystemIdleTime = () => 0;
-  for (const name of [
-    'disable-background-timer-throttling',
-    'disable-renderer-backgrounding',
-    'disable-backgrounding-occluded-windows',
-  ]) {
-    probe.switches[name] = app.commandLine.hasSwitch(name);
+  try {
+    const original = Tray.prototype.setTitle;
+    Tray.prototype.setTitle = function (title, ...rest) {
+      probe.tray.push([Date.now(), String(title)]);
+      return original.call(this, title, ...rest);
+    };
+    probe.trayPatch = 'ok';
+  } catch (error) {
+    probe.trayPatch = String(error);
   }
-  log('switches', JSON.stringify(probe.switches));
-  drive().then(
-    () => finish(0),
-    (error) => {
-      log('error', error && error.stack ? error.stack : String(error));
-      finish(1, error);
-    },
-  );
-});
+
+  app.once('ready', () => {
+    // Nobody uses the runner's keyboard or mouse. Report an active user, as if
+    // they were working in another app; otherwise idle detection stops adding
+    // time after 5 minutes and the comparison would be meaningless.
+    const { powerMonitor } = require('electron');
+    powerMonitor.getSystemIdleTime = () => 0;
+    for (const name of [
+      'disable-background-timer-throttling',
+      'disable-renderer-backgrounding',
+      'disable-backgrounding-occluded-windows',
+    ]) {
+      probe.switches[name] = app.commandLine.hasSwitch(name);
+    }
+    log('switches', JSON.stringify(probe.switches));
+    drive().then(
+      () => finish(0),
+      (error) => {
+        log('error', error && error.stack ? error.stack : String(error));
+        finish(1, error);
+      },
+    );
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -232,7 +262,11 @@ const setUp = async () => {
   // Add the task.
   const inputSelector = 'add-task-bar.global .main-input';
   if (!(await js(`!!document.querySelector(${JSON.stringify(inputSelector)})`))) {
-    await waitFor('the add button', () => js(`!!document.querySelector('.tour-addBtn')`), 20 * SECOND);
+    await waitFor(
+      'the add button',
+      () => js(`!!document.querySelector('.tour-addBtn')`),
+      20 * SECOND,
+    );
     await js(`document.querySelector('.tour-addBtn').click(); true`);
   }
   await waitFor('the add task input', () =>
@@ -327,7 +361,10 @@ const drive = async () => {
     const stateStart = winState();
     const phase = { name: step.name, stateStart };
     if (step.name === 'covered') {
-      phase.cover = { bounds: cover.bounds, coversMainWindow: contains(cover.bounds, stateStart.bounds) };
+      phase.cover = {
+        bounds: cover.bounds,
+        coversMainWindow: contains(cover.bounds, stateStart.bounds),
+      };
     }
     await run('screencapture', ['-x', path.join(OUT, `${step.name}.png`)]);
     phase.metricsStart = appMetrics();
@@ -360,7 +397,12 @@ const finish = async (code, error) => {
   fs.writeFileSync(
     path.join(OUT, 'raw.json'),
     JSON.stringify(
-      { phases, mainProbe: probe, rendererProbe, error: error ? String(error.stack || error) : null },
+      {
+        phases,
+        mainProbe: probe,
+        rendererProbe,
+        error: error ? String(error.stack || error) : null,
+      },
       null,
       1,
     ),
