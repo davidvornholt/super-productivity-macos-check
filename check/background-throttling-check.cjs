@@ -7,7 +7,8 @@
  * usage: node background-throttling-check.cjs <app checkout> <output dir> <label>
  *
  * The app checkout must be built (buildFrontend:prod:es6 + electron:build). The
- * app runs in production mode from that checkout with a fresh profile.
+ * app runs in production mode from that checkout with a fresh profile, and
+ * driver.cjs, loaded into its main process, runs the phases.
  */
 'use strict';
 
@@ -30,12 +31,11 @@ const SECOND = 1000;
 const MINUTE = 60 * SECOND;
 const PHASE_MS = Number(process.env.PHASE_MS) || 11 * MINUTE;
 const SHOWN_MS = Number(process.env.SHOWN_MS) || 2 * MINUTE;
-const SETTLE_MS = 5 * SECOND;
-const MAIN_URL_PART = 'angular-dist/browser/index.html';
 const COVER_SCRIPT = path.join(__dirname, 'cover-window.cjs');
 
+const DRIVER = path.join(__dirname, 'driver.cjs');
+
 const appRequire = createRequire(path.join(appDir, 'package.json'));
-const { _electron } = appRequire('@playwright/test');
 const electronPath = appRequire('electron');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -47,114 +47,6 @@ const run = (cmd, args, timeout = 20 * SECOND) =>
       resolve({ error: error ? String(error) : null, stdout: String(stdout), stderr: String(stderr) }),
     );
   });
-
-// ---------------------------------------------------------------------------
-// Main-process helpers
-// ---------------------------------------------------------------------------
-
-const mainWin = (electronApp, action) =>
-  electronApp.evaluate(
-    ({ BrowserWindow }, { action, urlPart }) => {
-      const win = BrowserWindow.getAllWindows().find((w) =>
-        w.webContents.getURL().includes(urlPart),
-      );
-      if (!win) {
-        throw new Error('main window not found');
-      }
-      if (action) {
-        win[action]();
-      }
-      return {
-        visible: win.isVisible(),
-        minimized: win.isMinimized(),
-        focused: win.isFocused(),
-        bounds: win.getBounds(),
-        visibleWindows: BrowserWindow.getAllWindows().filter((w) => w.isVisible()).length,
-      };
-    },
-    { action: action || null, urlPart: MAIN_URL_PART },
-  );
-
-const appMetrics = (electronApp) =>
-  electronApp.evaluate(({ app }) =>
-    app.getAppMetrics().map((m) => ({
-      pid: m.pid,
-      type: m.type,
-      name: m.name || m.serviceName || '',
-      percent: m.cpu.percentCPUUsage,
-      cumulative: m.cpu.cumulativeCPUUsage ?? null,
-      wakeups: m.cpu.idleWakeupsPerSecond,
-    })),
-  );
-
-const installMainProbe = (electronApp) =>
-  electronApp.evaluate(({ ipcMain, Tray, powerMonitor }) => {
-    const probe = { ipc: [], tray: [], trayPatch: 'not installed' };
-    globalThis.__bgCheck = probe;
-    // The renderer sends this after every tracking tick; it carries the task.
-    ipcMain.on('CURRENT_TASK_UPDATED', (_ev, task) => {
-      probe.ipc.push([Date.now(), task ? task.timeSpent : null]);
-    });
-    try {
-      const original = Tray.prototype.setTitle;
-      Tray.prototype.setTitle = function (title, ...rest) {
-        probe.tray.push([Date.now(), String(title)]);
-        return original.call(this, title, ...rest);
-      };
-      probe.trayPatch = 'ok';
-    } catch (error) {
-      probe.trayPatch = String(error);
-    }
-    // Nobody uses the runner's keyboard or mouse. Report an active user, as if
-    // they were working in another app; otherwise idle detection stops adding
-    // time after 5 minutes and the comparison would be meaningless.
-    powerMonitor.getSystemIdleTime = () => 0;
-    return probe.trayPatch;
-  });
-
-// ---------------------------------------------------------------------------
-// Covering window: a second app with a maximized window, started on demand.
-// ---------------------------------------------------------------------------
-
-const startCover = async () => {
-  const coverDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sp-bg-cover-'));
-  const child = spawn(electronPath, [COVER_SCRIPT, `--user-data-dir=${coverDataDir}`], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  child.stderr.on('data', (d) => process.stderr.write(`[cover] ${d}`));
-  const bounds = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('cover window did not open')), 60 * SECOND);
-    let buf = '';
-    child.stdout.on('data', (d) => {
-      buf += String(d);
-      const m = /COVER (\{.*\})/.exec(buf);
-      if (m) {
-        clearTimeout(timer);
-        resolve(JSON.parse(m[1]));
-      }
-    });
-    child.once('exit', (code) => reject(new Error(`cover window exited (${code})`)));
-  });
-  return { child, bounds };
-};
-
-const stopCover = async (cover) => {
-  if (!cover || cover.child.exitCode !== null) {
-    return;
-  }
-  const exited = new Promise((resolve) => cover.child.once('exit', resolve));
-  cover.child.kill('SIGTERM');
-  await Promise.race([exited, sleep(5 * SECOND)]);
-  if (cover.child.exitCode === null) {
-    cover.child.kill('SIGKILL');
-  }
-};
-
-const contains = (outer, inner) =>
-  outer.x <= inner.x &&
-  outer.y <= inner.y &&
-  outer.x + outer.width >= inner.x + inner.width &&
-  outer.y + outer.height >= inner.y + inner.height;
 
 // ---------------------------------------------------------------------------
 // Analysis
@@ -268,8 +160,7 @@ const analyse = (phase, data) => {
     Math.abs(result.trackedVsStopwatchAtEndMs) <= 3 * SECOND &&
     result.maxGapBetweenTrackingUpdatesMs <= 3 * SECOND &&
     result.tray.changes >= expectedChanges &&
-    result.tray.maxLateMs !== null &&
-    result.tray.maxLateMs <= 5 * SECOND;
+    (result.tray.maxLateMs === null ? expectedChanges <= 0 : result.tray.maxLateMs <= 5 * SECOND);
   return result;
 };
 
@@ -281,7 +172,7 @@ const toMarkdown = (summary) => {
     '',
     `${summary.system}`,
     '',
-    `Tray patch: ${summary.trayPatch}. Tracking started at ${new Date(summary.ref[0]).toISOString()}.`,
+    `Tray patch: ${summary.trayPatch}. Switches: ${JSON.stringify(summary.switches)}. Tracking started at ${new Date(summary.ref[0]).toISOString()}.`,
     '',
     '| Phase | Duration | visibilityState | Tracked − stopwatch at end | Gained (+) / lost (−) in phase | Longest gap between tracking updates | Tray title start → end (expected) | Tray changes | Tray title latest after its minute | Longest gap, 1 s interval | CPU, all processes | GPU idle wakeups/s | OK |',
     '| --- | ---: | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |',
@@ -306,44 +197,53 @@ const toMarkdown = (summary) => {
 // Run
 // ---------------------------------------------------------------------------
 
-const findMainPage = async (electronApp) => {
-  const deadline = Date.now() + 60 * SECOND;
-  while (Date.now() < deadline) {
-    const page = electronApp.windows().find((p) => p.url().includes(MAIN_URL_PART));
-    if (page) {
-      return page;
-    }
-    await sleep(250);
-  }
-  throw new Error(`no window with ${MAIN_URL_PART}: ${electronApp.windows().map((p) => p.url())}`);
-};
-
-const startTracking = async (page, title) => {
-  const input = page.locator('add-task-bar.global .main-input').first();
-  if (!(await input.isVisible())) {
-    await page.locator('.tour-addBtn').waitFor({ state: 'visible', timeout: 20 * SECOND });
-    await page.locator('.tour-addBtn').click();
-  }
-  await input.waitFor({ state: 'visible', timeout: 10 * SECOND });
-  await input.fill(title);
-  await input.press('Enter');
-  const task = page.locator('task').filter({ hasText: title }).first();
-  await task.waitFor({ state: 'visible', timeout: 20 * SECOND });
-  await page.keyboard.press('Escape');
-  await sleep(500);
-  for (let i = 0; i < 20; i++) {
-    if (await task.evaluate((el) => el.classList.contains('isCurrent'))) {
-      return;
-    }
-    await task.hover();
-    await task
-      .locator('.start-task-btn')
-      .click({ timeout: 2 * SECOND })
-      .catch(() => undefined);
-    await sleep(1000);
-  }
-  throw new Error('could not start tracking');
-};
+const runApp = (userDataDir) =>
+  new Promise((resolve) => {
+    const appLog = fs.createWriteStream(path.join(outDir, 'app.log'));
+    const child = spawn(electronPath, [appDir, `--user-data-dir=${userDataDir}`], {
+      cwd: appDir,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        NODE_ENV: 'PROD',
+        NODE_OPTIONS: `--require ${DRIVER}`,
+        BG_CHECK_OUT: outDir,
+        BG_CHECK_PHASE_MS: String(PHASE_MS),
+        BG_CHECK_SHOWN_MS: String(SHOWN_MS),
+        BG_CHECK_COVER: COVER_SCRIPT,
+        BG_CHECK_ELECTRON: electronPath,
+      },
+    });
+    let driverLoaded = false;
+    const onData = (d) => {
+      appLog.write(d);
+      for (const line of String(d).split('\n')) {
+        if (line.includes('[bg-check]')) {
+          driverLoaded = true;
+          console.log(line);
+        }
+      }
+    };
+    child.stdout.on('data', onData);
+    child.stderr.on('data', onData);
+    const budget = SHOWN_MS + 3 * PHASE_MS + 10 * MINUTE;
+    const killTimer = setTimeout(() => {
+      log('the app ran out of time, killing it');
+      child.kill('SIGKILL');
+    }, budget);
+    const loadTimer = setTimeout(() => {
+      if (!driverLoaded) {
+        log('the driver did not load, killing the app');
+        child.kill('SIGKILL');
+      }
+    }, 2 * MINUTE);
+    child.once('exit', (code, signal) => {
+      clearTimeout(killTimer);
+      clearTimeout(loadTimer);
+      appLog.end();
+      resolve({ code, signal });
+    });
+  });
 
 const main = async () => {
   const system = [
@@ -356,139 +256,17 @@ const main = async () => {
   log(system);
 
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sp-bg-check-'));
-  const electronApp = await _electron.launch({
-    executablePath: electronPath,
-    args: [appDir, `--user-data-dir=${userDataDir}`],
-    cwd: appDir,
-    env: { ...process.env, NODE_ENV: 'PROD' },
-    timeout: 120 * SECOND,
-  });
-  electronApp.process().stdout.on('data', (d) => fs.appendFileSync(path.join(outDir, 'app.log'), d));
-  electronApp.process().stderr.on('data', (d) => fs.appendFileSync(path.join(outDir, 'app.log'), d));
-
-  const phases = [];
-  let cover = null;
-  let mainProbe = null;
-  let rendererProbe = null;
-  let trayPatch = null;
-  let page = null;
-  try {
-    page = await findMainPage(electronApp);
-    await page.waitForLoadState('domcontentloaded');
-    await page.evaluate(() => {
-      localStorage.setItem('SUP_ONBOARDING_PRESET_DONE', 'true');
-      localStorage.setItem('SUP_ONBOARDING_HINTS_DONE', 'true');
-      localStorage.setItem('SUP_IS_SHOW_TOUR', 'true');
-      localStorage.setItem('SUP_EXAMPLE_TASKS_CREATED', 'true');
-    });
-    const dataLoaded = page.waitForEvent('console', {
-      predicate: (m) => m.text().includes('[SP_ALL] All Data was loaded'),
-      timeout: 60 * SECOND,
-    });
-    await page.reload({ waitUntil: 'domcontentloaded' });
-    await dataLoaded;
-    await page.locator('.route-wrapper').first().waitFor({ state: 'visible' });
-
-    trayPatch = await installMainProbe(electronApp);
-    log('tray patch', trayPatch);
-    await page.evaluate(() => {
-      const probe = { ticks: [], vis: [[Date.now(), document.visibilityState]] };
-      window.__bgCheck = probe;
-      setInterval(() => probe.ticks.push(Date.now()), 1000);
-      document.addEventListener('visibilitychange', () =>
-        probe.vis.push([Date.now(), document.visibilityState]),
-      );
-    });
-
-    await startTracking(page, 'Background throttling check');
-    const deadline = Date.now() + 30 * SECOND;
-    while (Date.now() < deadline) {
-      const n = await electronApp.evaluate(
-        () => globalThis.__bgCheck.ipc.filter(([, s]) => s > 0).length,
-      );
-      if (n > 0) {
-        break;
-      }
-      await sleep(500);
-    }
-    log('tracking');
-
-    const activateOtherApp = () => run('open', ['-a', 'Finder']);
-    const showMain = async () => {
-      await mainWin(electronApp, 'show');
-      await mainWin(electronApp, 'focus');
-    };
-    const steps = [
-      { name: 'shown', duration: SHOWN_MS, enter: showMain, exit: async () => {} },
-      {
-        name: 'hidden',
-        duration: PHASE_MS,
-        enter: async () => {
-          await mainWin(electronApp, 'hide');
-          await activateOtherApp();
-        },
-        exit: showMain,
-      },
-      {
-        name: 'minimized',
-        duration: PHASE_MS,
-        enter: async () => {
-          await mainWin(electronApp, 'minimize');
-          await activateOtherApp();
-        },
-        exit: async () => {
-          await mainWin(electronApp, 'restore');
-          await mainWin(electronApp, 'focus');
-        },
-      },
-      {
-        name: 'covered',
-        duration: PHASE_MS,
-        enter: async () => {
-          cover = await startCover();
-        },
-        exit: async () => {
-          await stopCover(cover);
-          await mainWin(electronApp, 'focus');
-        },
-      },
-    ];
-
-    for (const step of steps) {
-      log('enter', step.name);
-      await step.enter();
-      await sleep(SETTLE_MS);
-      const stateStart = await mainWin(electronApp);
-      const phase = { name: step.name, stateStart };
-      if (step.name === 'covered') {
-        phase.cover = { bounds: cover.bounds, coversMainWindow: contains(cover.bounds, stateStart.bounds) };
-      }
-      await run('screencapture', ['-x', path.join(outDir, `${step.name}.png`)]);
-      phase.metricsStart = await appMetrics(electronApp);
-      phase.tStart = Date.now();
-      await sleep(step.duration);
-      phase.tEnd = Date.now();
-      phase.metricsEnd = await appMetrics(electronApp);
-      phase.stateEnd = await mainWin(electronApp);
-      phases.push(phase);
-      log('exit', step.name, JSON.stringify(phase.stateStart));
-      await step.exit();
-      await sleep(SETTLE_MS);
-    }
-  } finally {
-    await stopCover(cover).catch(() => undefined);
-    mainProbe = await electronApp.evaluate(() => globalThis.__bgCheck).catch(() => null);
-    rendererProbe = page ? await page.evaluate(() => window.__bgCheck).catch(() => null) : null;
-    fs.writeFileSync(
-      path.join(outDir, 'raw.json'),
-      JSON.stringify({ label, phases, mainProbe, rendererProbe }, null, 1),
-    );
-    const proc = electronApp.process();
-    await Promise.race([electronApp.close().catch(() => undefined), sleep(10 * SECOND)]);
-    if (proc.exitCode === null) {
-      proc.kill('SIGKILL');
-    }
+  const exit = await runApp(userDataDir);
+  log('app exited', JSON.stringify(exit));
+  const rawPath = path.join(outDir, 'raw.json');
+  if (!fs.existsSync(rawPath)) {
+    throw new Error('the driver wrote no raw.json; see app.log');
   }
+  const raw = JSON.parse(fs.readFileSync(rawPath, 'utf8'));
+  if (raw.error) {
+    throw new Error(`the driver failed: ${raw.error}`);
+  }
+  const { phases, mainProbe, rendererProbe } = raw;
 
   const ref = mainProbe.ipc.find(([, spent]) => spent > 0);
   const data = {
@@ -501,7 +279,8 @@ const main = async () => {
   const summary = {
     label,
     system,
-    trayPatch,
+    trayPatch: mainProbe.trayPatch,
+    switches: mainProbe.switches,
     ref,
     phases: phases.map((p) => analyse(p, data)),
   };
