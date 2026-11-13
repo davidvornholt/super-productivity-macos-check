@@ -1,0 +1,99 @@
+name: macOS background throttling check
+
+# Temporary: runs the manual test of super-productivity/super-productivity#11193
+# on GitHub-hosted macOS runners, with and without the change.
+#   before  = 56b32292ad, the PR's parent (backgroundThrottling: false)
+#   after   = d6057c4388, the PR head
+#   control = the PR head without its two timer switches, to show that the
+#             check notices throttled timers
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  SHOWN_MS: '20000'
+  PHASE_MS: '45000'
+
+jobs:
+  check:
+    name: ${{ matrix.variant }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-15, variant: after }
+          - { os: macos-15, variant: control }
+          - { os: macos-26, variant: before }
+    steps:
+      - name: Check out the check scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          path: check
+          persist-credentials: false
+
+      - name: Check out the app
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          repository: davidvornholt/super-productivity
+          ref: ${{ matrix.variant == 'before' && '56b32292ad652f560616301ec52846c2b3892f7f' || 'd6057c4388cc8dd9bc1e838269f9a6e7a61a414f' }}
+          path: app
+          persist-credentials: false
+
+      - name: Remove the timer switches (control only)
+        if: matrix.variant == 'control'
+        working-directory: app
+        run: |
+          perl -ni -e "print unless /appendSwitch\('disable-(background-timer-throttling|renderer-backgrounding)'\)/" electron/start-app.ts
+          git diff
+
+      - name: Show the settings under test
+        working-directory: app
+        run: |
+          git log -1 --oneline
+          grep -n "backgroundThrottling\|appendSwitch('disable-" electron/main-window.ts electron/start-app.ts electron/task-widget/task-widget.ts
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+        with:
+          node-version-file: app/.nvmrc
+
+      - name: Reconfigure git to use HTTP authentication
+        run: git config --global url."https://github.com/".insteadOf ssh://git@github.com/
+
+      - name: Install npm packages
+        working-directory: app
+        run: npm install --no-audit --no-fund @nx/nx-darwin-arm64 && npm i --no-audit --no-fund
+
+      - name: Build
+        working-directory: app
+        env:
+          NODE_OPTIONS: '--max-old-space-size=4096'
+        run: |
+          npm run buildFrontend:prod:es6
+          npm run electron:build
+          node -e "console.log(require('electron'))"
+
+      - name: System
+        run: |
+          sw_vers
+          sysctl -n hw.model machdep.cpu.brand_string hw.ncpu
+          system_profiler SPDisplaysDataType | grep -i "resolution\|display type" || true
+          sudo pmset -a displaysleep 0 sleep 0 || true
+          pmset -g
+
+      - name: Run the check
+        run: caffeinate -dims node check/check/background-throttling-check.cjs app "out/${{ matrix.variant }}-${{ matrix.os }}" "${{ matrix.variant }} on ${{ matrix.os }}"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.variant }}-${{ matrix.os }}
+          path: out/
+          if-no-files-found: warn
