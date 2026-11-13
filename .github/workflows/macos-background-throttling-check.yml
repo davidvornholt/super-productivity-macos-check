@@ -6,6 +6,10 @@ name: macOS background throttling check
 #   after   = d6057c4388, the PR head
 #   control = the PR head without its two timer switches, to show that the
 #             check notices throttled timers
+#
+# GitHub's macOS images turn App Nap off for every app (NSAppSleepDisabled in
+# images/macos/scripts/build/configure-machine.sh of actions/runner-images).
+# The check turns it back on, as on a normal Mac.
 
 on:
   workflow_dispatch:
@@ -32,7 +36,6 @@ jobs:
           - { os: macos-26, variant: after }
           - { os: macos-15, variant: before }
           - { os: macos-26, variant: before }
-          - { os: macos-15, variant: control }
     steps:
       - name: Check out the check scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -88,9 +91,17 @@ jobs:
           system_profiler SPDisplaysDataType | grep -i "resolution\|display type" || true
           sudo pmset -a displaysleep 0 sleep 0 || true
           pmset -g
+          pmset -g assertions || true
+          ls -l /usr/bin/taskinfo || true
+
+      - name: Turn App Nap back on
+        run: |
+          echo "before: $(defaults read NSGlobalDomain NSAppSleepDisabled 2>&1)"
+          defaults write NSGlobalDomain NSAppSleepDisabled -bool NO
+          echo "after: $(defaults read NSGlobalDomain NSAppSleepDisabled 2>&1)"
 
       - name: Run the check
-        run: caffeinate -dims node check/check/background-throttling-check.cjs app "out/${{ matrix.variant }}-${{ matrix.os }}" "${{ matrix.variant }} on ${{ matrix.os }}"
+        run: node check/check/background-throttling-check.cjs app "out/${{ matrix.variant }}-${{ matrix.os }}" "${{ matrix.variant }} on ${{ matrix.os }}"
 
       - name: Upload results
         if: always()

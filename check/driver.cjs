@@ -77,7 +77,7 @@ const run = (cmd, args, timeout = 20 * SECOND) =>
 // Probes, installed before the app's own code runs
 // ---------------------------------------------------------------------------
 
-const probe = { ipc: [], tray: [], trayPatch: 'not installed', switches: {} };
+const probe = { ipc: [], tray: [], mainTicks: [], trayPatch: 'not installed', switches: {} };
 
 function init(electron) {
   ({ app, BrowserWindow, ipcMain, Tray } = electron);
@@ -113,6 +113,8 @@ function init(electron) {
       probe.switches[name] = app.commandLine.hasSwitch(name);
     }
     log('switches', JSON.stringify(probe.switches));
+    // A 1 s timer in the main process: App Nap would stretch it.
+    setInterval(() => probe.mainTicks.push(Date.now()), 1000);
     drive().then(
       () => finish(0),
       (error) => {
@@ -208,6 +210,26 @@ const contains = (outer, inner) =>
   outer.y <= inner.y &&
   outer.x + outer.width >= inner.x + inner.width &&
   outer.y + outer.height >= inner.y + inner.height;
+
+// taskinfo shows each process's task role, QoS tiers and timer throttling,
+// which is where App Nap shows up.
+const snapshotPolicy = async (name) => {
+  const pids = [
+    ['browser', process.pid],
+    ['renderer', mainWin.webContents.getOSProcessId()],
+    ...app
+      .getAppMetrics()
+      .filter((m) => m.type === 'GPU')
+      .map((m) => ['gpu', m.pid]),
+  ];
+  let text = `${new Date().toISOString()}\n`;
+  for (const [label, pid] of pids) {
+    const ps = await run('ps', ['-o', 'pid,pri,nice,stat,command', '-p', String(pid)]);
+    const info = await run('sudo', ['-n', 'taskinfo', String(pid)]);
+    text += `\n===== ${label} ${pid}\n${ps.stdout}${ps.error || ''}\n${info.stdout}${info.error || ''}\n`;
+  }
+  fs.writeFileSync(path.join(OUT, `taskinfo-${name}.txt`), text);
+};
 
 // ---------------------------------------------------------------------------
 // Setup: skip onboarding, add a task and start tracking it
@@ -369,7 +391,11 @@ const drive = async () => {
     await run('screencapture', ['-x', path.join(OUT, `${step.name}.png`)]);
     phase.metricsStart = appMetrics();
     phase.tStart = Date.now();
-    await sleep(step.duration);
+    // Snapshot the processes' scheduling policy once App Nap would have kicked in.
+    const snapshotAt = Math.min(2 * 60 * SECOND, step.duration / 2);
+    await sleep(snapshotAt);
+    await snapshotPolicy(step.name);
+    await sleep(step.duration - (Date.now() - phase.tStart));
     phase.tEnd = Date.now();
     phase.metricsEnd = appMetrics();
     phase.stateEnd = winState();

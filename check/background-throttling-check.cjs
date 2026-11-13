@@ -97,7 +97,7 @@ const sumMetrics = (start, end, seconds) => {
 };
 
 const analyse = (phase, data) => {
-  const { ipc, tray, ticks, vis, ref } = data;
+  const { ipc, tray, ticks, mainTicks, vis, ref } = data;
   const { tStart, tEnd } = phase;
   const drift = ([t, spent]) => spent - ref[1] - (t - ref[0]);
   const stopwatchAt = (t) => ref[1] + (t - ref[0]);
@@ -146,6 +146,7 @@ const analyse = (phase, data) => {
       maxEarlyMs: trayDelays.length ? -Math.min(...trayDelays) : null,
     },
     maxGapOf1sIntervalMs: maxGap(ticks, tStart, tEnd),
+    maxGapOfMain1sIntervalMs: mainTicks ? maxGap(mainTicks, tStart, tEnd) : null,
     cpuPercentAllProcesses: Number(cpu.percent.toFixed(2)),
     cpuByType: Object.fromEntries(
       Object.entries(cpu.byType).map(([k, v]) => [
@@ -174,13 +175,13 @@ const toMarkdown = (summary) => {
     '',
     `Tray patch: ${summary.trayPatch}. Switches: ${JSON.stringify(summary.switches)}. Tracking started at ${new Date(summary.ref[0]).toISOString()}.`,
     '',
-    '| Phase | Duration | visibilityState | Tracked − stopwatch at end | Gained (+) / lost (−) in phase | Longest gap between tracking updates | Tray title start → end (expected) | Tray changes | Tray title latest after its minute | Longest gap, 1 s interval | CPU, all processes | GPU idle wakeups/s | OK |',
-    '| --- | ---: | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |',
+    '| Phase | Duration | visibilityState | Tracked − stopwatch at end | Gained (+) / lost (−) in phase | Longest gap between tracking updates | Tray title start → end (expected) | Tray changes | Tray title latest after its minute | Longest gap, 1 s interval | Same, main process | CPU, all processes | GPU idle wakeups/s | OK |',
+    '| --- | ---: | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |',
   ];
   for (const p of summary.phases) {
     const gpu = p.cpuByType.GPU || p.cpuByType.gpu;
     lines.push(
-      `| ${p.name} | ${p.durationS} s | ${p.visibilityState} | ${fmtS(p.trackedVsStopwatchAtEndMs)} | ${fmtS(p.timeLostInPhaseMs)} | ${fmtS(p.maxGapBetweenTrackingUpdatesMs)} | ${p.tray.atStart} → ${p.tray.atEnd} (${p.tray.expectedAtEnd}) | ${p.tray.changes} | ${fmtS(p.tray.maxLateMs)} | ${fmtS(p.maxGapOf1sIntervalMs)} | ${p.cpuPercentAllProcesses} % | ${gpu ? gpu.idleWakeupsPerS : 'n/a'} | ${p.ok ? 'yes' : 'NO'} |`,
+      `| ${p.name} | ${p.durationS} s | ${p.visibilityState} | ${fmtS(p.trackedVsStopwatchAtEndMs)} | ${fmtS(p.timeLostInPhaseMs)} | ${fmtS(p.maxGapBetweenTrackingUpdatesMs)} | ${p.tray.atStart} → ${p.tray.atEnd} (${p.tray.expectedAtEnd}) | ${p.tray.changes} | ${fmtS(p.tray.maxLateMs)} | ${fmtS(p.maxGapOf1sIntervalMs)} | ${fmtS(p.maxGapOfMain1sIntervalMs)} | ${p.cpuPercentAllProcesses} % | ${gpu ? gpu.idleWakeupsPerS : 'n/a'} | ${p.ok ? 'yes' : 'NO'} |`,
     );
   }
   lines.push('');
@@ -273,6 +274,7 @@ const main = async () => {
     ipc: mainProbe.ipc.filter(([, spent]) => spent !== null),
     tray: mainProbe.tray,
     ticks: rendererProbe.ticks,
+    mainTicks: mainProbe.mainTicks,
     vis: rendererProbe.vis,
     ref,
   };
